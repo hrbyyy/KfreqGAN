@@ -1,0 +1,554 @@
+# coding:--utf-8--
+
+import sys
+import torch
+import torch.nn as nn
+from torch.nn.utils import weight_norm
+import os
+import argparse
+
+curPath = os.path.abspath(os.path.dirname(__file__))
+
+fatherpath = os.path.split(curPath)[0]
+grandpath=os.path.split(fatherpath)[0]
+greatgrandpath=os.path.split(grandpath)[0]
+gggpath=os.path.split(greatgrandpath)[0]
+extra_path='/home/ices/PycharmProject/shape_sequence_kpi/uts/conditional_conv/model_combine/'
+sys.path.append(fatherpath)
+sys.path.append(curPath)
+sys.path.append(grandpath)
+sys.path.append(greatgrandpath)
+sys.path.append(gggpath)
+sys.path.append(os.path.split(gggpath)[0])
+sys.path.append(extra_path)
+import numpy as np
+import pandas as pd
+import torch.optim as optim
+import torch.utils.data as Data
+from torch.optim.lr_scheduler import MultiStepLR
+import pickle
+# import matplotlib.pyplot as plt
+from functools import reduce
+from torch.nn import BatchNorm1d
+import time
+import score_GAN
+import gc
+
+import math
+# import dataformatter
+# import scipy
+
+
+#from pytorchtools import EarlyStopping
+# from torch.tools import EarlyStopping
+# np.random.seed(7)
+# torch.manual_seed(1)  # reproducible
+
+
+datapath='/mnt/A/dataset/Yahoo A1A2/ydata-labeled-time-series-anomalies-v1_0/A2Benchmark/'
+
+
+def form_dataloader(batchsize,inpath,lb,lp):
+    trainx_new=pickle.load(open(inpath+'trainx.pkl','rb'))
+    val1x_new=pickle.load(open(inpath+'val1x.pkl','rb'))
+    val2x_new = pickle.load(open(inpath +'val2x.pkl', 'rb'))
+    testx_new = pickle.load(open(inpath + 'testx.pkl', 'rb'))
+
+    trainy=pickle.load(open(inpath+'trainy.pkl','rb'))
+    val1y = pickle.load(open(inpath + 'val1y.pkl', 'rb'))
+    val2y = pickle.load(open(inpath +'val2y.pkl', 'rb'))
+    testy = pickle.load(open(inpath + 'testy.pkl', 'rb'))
+
+    train_kf = pickle.load(open(inpath +'train_kf.pkl', 'rb'))
+    val1_kf = pickle.load(open(inpath +'val1_kf.pkl', 'rb'))
+    val2_kf = pickle.load(open(inpath + 'val2_kf.pkl', 'rb'))
+    test_kf = pickle.load(open(inpath +'test_kf.pkl', 'rb'))
+
+
+    train_x = torch.from_numpy(trainx_new).type(torch.FloatTensor)
+    val1_x = torch.from_numpy(val1x_new).type(torch.FloatTensor)
+    val2_x = torch.from_numpy(val2x_new).type(torch.FloatTensor)
+    test_x = torch.from_numpy(testx_new).type(torch.FloatTensor)
+
+    train_y = torch.from_numpy(trainy).type(torch.FloatTensor)
+    val1_y = torch.from_numpy(val1y).type(torch.FloatTensor)
+    val2_y = torch.from_numpy(val2y).type(torch.FloatTensor)
+    test_y = torch.from_numpy(testy).type(torch.FloatTensor)
+
+
+    train_kf=torch.from_numpy(train_kf).unsqueeze(dim=2).repeat(1,1,lb).type(torch.FloatTensor) #(b,k)化为（b,t,k）
+    val1_kf = torch.from_numpy(val1_kf).unsqueeze(dim=2).repeat(1,1,lb).type(torch.FloatTensor)  # (b,k)化为（b,t,k）
+    val2_kf = torch.from_numpy(val2_kf).unsqueeze(dim=2).repeat(1,1,lb).type(torch.FloatTensor)  # (b,k)化为（b,t,k）
+    test_kf = torch.from_numpy(test_kf).unsqueeze(dim=2).repeat(1,1,lb).type(torch.FloatTensor)  # (b,k)化为（b,t,k）
+
+    train_x=torch.cat([train_x,train_kf],dim=1)
+    val1_x = torch.cat([val1_x, val1_kf], dim=1)
+    val2_x = torch.cat([val2_x, val2_kf], dim=1)
+    test_x = torch.cat([test_x, test_kf], dim=1)
+
+    torch_trainset = Data.TensorDataset(train_x, train_y)
+    # 把 dataset 放入 DataLoader
+    trainloader = Data.DataLoader(
+        dataset=torch_trainset,  # torch TensorDataset format
+        batch_size=batchsize,  # mini batch size
+        shuffle=True  # 要不要打乱数据 (打乱比较好)
+    )
+    val1data = Data.TensorDataset(val1_x, val1_y)
+    val1loader = Data.DataLoader(dataset=val1data, shuffle=True, batch_size=batchsize)
+    val2data = Data.TensorDataset(val2_x, val2_y)
+    val2loader = Data.DataLoader(dataset=val2data, shuffle=False, batch_size=batchsize)
+    testdata = Data.TensorDataset(test_x, test_y)
+    testloader = Data.DataLoader(dataset=testdata, shuffle=False, batch_size=batchsize)
+
+    return trainloader,val1loader,val2loader,testloader
+
+class Options:
+    def __init__(self,ngf,ndf,c_in,c_out,lb,lp):
+        ##
+        #
+        self.ngf=ngf
+        self.ndf=ndf
+        # self.nz=nz
+        # self.dnz=dnz
+        self.c_in=c_in
+        self.c_out=c_out
+        self.lb=lb
+        self.lp=lp
+
+
+
+class Encoder(nn.Module):
+    def __init__(self,opt):
+        super(Encoder, self).__init__()
+        layer1=nn.Conv1d(opt.c_in,opt.ngf,4,2,1,bias=False)
+        BN1=nn.BatchNorm1d(opt.ngf)
+        activation1=nn.ReLU(inplace=True)
+        layer2=nn.Conv1d(opt.ngf,2*opt.ngf,4,2,1,bias=False)
+        BN2=nn.BatchNorm1d(2*opt.ngf)
+        activation2=nn.ReLU(inplace=True)
+        self.encoder=nn.Sequential(layer1,BN1,activation1,layer2,BN2,activation2)
+
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return z
+
+
+
+class Decoder(nn.Module):
+    def __init__(self, opt):
+        super(Decoder, self).__init__()
+        layer1=nn.ConvTranspose1d(2*opt.ngf,opt.ngf,4,2,1,bias=False)
+        BN1=nn.BatchNorm1d(opt.ngf)
+        activation1=nn.ReLU(inplace=True)
+        layer2=nn.Conv1d(opt.ngf,opt.c_out,10,1,0,bias=False)
+        activation2=nn.Tanh()
+        self.decoder=nn.Sequential(layer1,BN1,activation1,layer2,activation2)
+
+    def forward(self, z):
+        x=self.decoder(z)
+        return x
+
+class Generator(nn.Module):
+
+    def __init__(self, opt):
+        super(Generator, self).__init__()
+        self.encoder1 = Encoder(opt)
+        self.decoder = Decoder(opt)
+
+    def forward(self, x):
+        latent_i = self.encoder1(x)
+        gen_x = self.decoder(latent_i)
+        return gen_x, latent_i
+
+class Discriminator(nn.Module):
+    def __init__(self, opt):
+        super(Discriminator, self).__init__()
+
+        layer1=nn.ConvTranspose1d(opt.c_out,opt.ndf,4,2,1,bias=False)
+        activation1=nn.LeakyReLU(0.2,inplace=True)
+        layer2=nn.Conv1d(opt.ndf,opt.c_out,4,2,1,bias=False)
+        BN2=nn.BatchNorm1d(opt.c_out)
+        self.features=nn.Sequential(layer1,activation1)
+        self.classifier=nn.Sequential(layer2,BN2)
+    def forward(self, x):
+
+        features = self.features(x)
+        classifier = self.classifier(features)
+        classifier = classifier.squeeze(dim=1)
+
+        return classifier, features
+
+
+
+
+def train(Generator,k, lambda_m,lambda_b,Discriminator,d_clip, device, trainloader,epoch, optimizer_g, optimizer_d):
+    rloss_d=0
+    running_loss_d=0
+    rloss_g = 0
+    running_loss_g = 0.0  #
+    Generator.train()
+    Discriminator.train()
+    criterion_g=torch.nn.MSELoss(reduction='sum')
+    criterion_d=torch.nn.BCELoss(reduction='sum')
+
+    for i, data in enumerate(trainloader):
+
+        inputs = data[0][:, :-k - 1, :]
+        targets = data[1][:, :-1, :]
+        kf = data[0][:, -k:, :]
+        inputs = torch.cat([inputs, kf], dim=1)
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+
+        real_label = torch.ones(size=(targets.shape[0], targets.shape[2]), device=device)
+        predict_label = torch.zeros(size=(targets.shape[0], targets.shape[2]), device=device)
+
+        optimizer_g.zero_grad()
+        outputs_g,_ = Generator(inputs)
+        g_label,g_middle=Discriminator(outputs_g)
+        real_out, real_middle = Discriminator(targets)
+
+        loss_g_b = criterion_g(g_middle,real_middle)
+        loss_g_m=criterion_g(outputs_g,targets)
+        loss_g=lambda_m*loss_g_m+lambda_b*loss_g_b
+        loss_g.backward()
+        optimizer_g.step()
+        rloss_g += loss_g.item()
+        running_loss_g += loss_g.item()
+        optimizer_d.zero_grad()
+        real_out, real_middle = Discriminator(targets)
+        d_loss_real =criterion_d(real_out, real_label)
+        predict_out, predict_middle = Discriminator(outputs_g.detach())
+        d_loss_fake = criterion_d(predict_out, predict_label)
+
+
+        d_loss = d_loss_real + d_loss_fake
+        d_loss.backward()
+
+        optimizer_d.step()
+        for para in Discriminator.parameters():
+            if para.requires_grad_ == True:
+                torch.nn.utils.clip_grad_value_(para, d_clip)
+
+        rloss_d += d_loss
+        running_loss_d += d_loss
+
+        if i % 20 == 19:  # print every  20 steps
+            print('[%d, %5d] G train loss: %.3f   D train loss:%.3f'  %
+                  (epoch + 1, i + 1, running_loss_g / 20,running_loss_d/20))
+            running_loss_g = 0.0
+            running_loss_d=0.0
+    print('[%d] G train loss: %.3f   D train loss:%.3f' %
+          (epoch + 1,  rloss_g , rloss_d / 20))
+
+    torch.cuda.empty_cache()
+    del trainloader
+    gc.collect()
+    return
+
+
+
+def val(Generator,k,lp,output_dim, lambda_b, lambda_m, Discriminator, device, valloader, epoch, ep,  vloss, counter, patience, threshold, outp, optimizer):
+
+    n_samples = len(valloader.dataset)
+    labels = torch.empty(size=(n_samples, lp), dtype=torch.float32, device=device)
+    predict_probs = torch.empty(size=(n_samples, lp), dtype=torch.float32, device=device)
+    errlist = torch.empty(size=(n_samples, output_dim, lp), dtype=torch.float32, device=device)
+    predict_seqs = torch.empty(size=(n_samples, output_dim, lp), dtype=torch.float32, device=device)
+    real_seqs = torch.empty(size=(n_samples, output_dim, lp), dtype=torch.float32, device=device)
+
+
+    Generator.eval()
+    Discriminator.eval()
+    val_loss_g = 0
+    vtotal_l_g = 0
+    val_loss_d=0
+    vtotal_l_d=0
+
+
+    criterion2 = torch.nn.MSELoss(reduction='none')
+    criterion_g = torch.nn.MSELoss(reduction='sum')
+    criterion_d= torch.nn.BCELoss(reduction='sum')
+    batchnumber=0
+    with torch.no_grad():
+        for batch_idx, data in enumerate(valloader):
+            start_idx = batch_idx * batchsize
+            end_idx = min(n_samples, int((batch_idx + 1) * batchsize))
+            batchnumber+=1
+            label = data[1][:, -1, :]
+            kf = data[0][:, -k:, :]
+            inputs, targets = data[0][:, :-k - 1, :], data[1][:, :-1, :]
+            inputs = torch.cat([inputs, kf], dim=1)
+            inputs, targets = inputs.to(device), targets.to(device)
+            real_label =  torch.ones(size=(targets.shape[0], targets.shape[2]), device=device)
+            predict_label = torch.zeros(size=(targets.shape[0], targets.shape[2]), device=device)
+
+            real_out,real_middle = Discriminator(targets)
+            d_loss_real =criterion_d(real_out, real_label)
+            predict_out,_ = Generator(inputs)
+            output_g=predict_out
+            predict_prob,predict_middle = Discriminator(output_g)
+            d_loss_fake =criterion_d(predict_prob, predict_label)
+            d_loss = d_loss_real + d_loss_fake
+            val_loss_d += d_loss.item()
+            vtotal_l_d += d_loss.item()
+
+
+            real_out, real_middle = Discriminator(targets)
+            loss_gb = criterion_g(predict_middle,real_middle)
+            loss_gm=criterion_g(output_g,targets)
+            loss_g=lambda_b*loss_gb+lambda_m*loss_gm
+
+
+
+            err=criterion2(output_g,targets)
+            real_seqs[start_idx:end_idx, :, :] = targets
+            predict_seqs[start_idx:end_idx, :, :] = output_g
+            errlist[start_idx:end_idx, :, :] = err
+            labels[start_idx:end_idx, :] = label
+            predict_probs[start_idx:end_idx, :] = predict_prob
+
+            val_loss_g += loss_g.item()
+            vtotal_l_g += loss_g.item()
+
+            if batch_idx % 20 == 19:
+                print('[%d, %5d] G val loss: %.3f D val loss %.3f' %
+                      (epoch + 1, batch_idx + 1, val_loss_g / 20, val_loss_d/20))
+                val_loss_d=0
+
+    print('%d val G loss: %.3f  val D loss: %.3f' %(epoch + 1, vtotal_l_g,vtotal_l_d))
+    predict_seqs = predict_seqs.detach().cpu().numpy()
+    real_seqs = real_seqs.detach().cpu().numpy()
+    errlist = errlist.detach().cpu().numpy()
+    labels = labels.detach().cpu().numpy()
+    predict_probs = predict_probs.detach().cpu().numpy()
+
+    if vtotal_l_g>vloss-threshold:
+        counter+=1
+
+    else:
+        counter = 0
+        vloss = vtotal_l_g
+        state = {
+            'generator': Generator.state_dict(),
+            'discriminator':Discriminator.state_dict(),
+            'val_G_loss': vtotal_l_g,
+            'val_D_loss':vtotal_l_d,
+            'epoch': epoch + 1,
+            'optimizer': optimizer.state_dict(),
+            'err_vectors':errlist,
+            'true_labels':labels,
+            'predict_seqs':predict_seqs,
+            'real_seqs':real_seqs,
+            'predict_probs':predict_probs
+        }
+        ep = epoch
+        torch.save(state, outp + 'model.pth')
+
+    print(counter)
+    torch.cuda.empty_cache()
+
+    return vloss, ep, counter, labels
+
+
+def inference(device,testloader,lambda_m,lambda_b,k,lp,opt,outp,filename):
+    pred_loss_d = 0
+    pred_loss_features=0
+    pred_loss_g=0
+    n_samples = len(testloader.dataset)
+    labels = torch.empty(size=(n_samples, lp), device=device)
+    predict_probs = torch.empty(size=(n_samples, lp), device=device)
+    errlist = torch.empty(size=(n_samples, opt.c_out, lp), device=device)
+    predict_seqs = torch.empty(size=(n_samples, opt.c_out, lp), device=device)
+    real_seqs = torch.empty(size=(n_samples, opt.c_out, lp), device=device)
+
+    with torch.no_grad():
+        generator=Generator(opt)
+        generator=nn.DataParallel(generator)
+        generator.to(device)
+        generator.eval()
+
+        discriminator=Discriminator(opt)
+        discriminator=nn.DataParallel(discriminator)
+        discriminator.to(device)
+        discriminator.eval()
+
+        criterion_g = torch.nn.MSELoss(reduction='sum')
+        criterion_d = torch.nn.BCELoss(reduction='sum')
+        criterion2 = torch.nn.MSELoss(reduction='none')
+        state = torch.load(outp+'model.pth')
+        generator.load_state_dict(state['generator'])
+        discriminator.load_state_dict(state['discriminator'])
+        torch.cuda.synchronize()
+        t0=time.clock()
+        for batch_idx, data in enumerate(testloader):
+            start_idx = batch_idx * batchsize
+            end_idx = min(n_samples, int((batch_idx + 1) * batchsize))
+
+            label = data[1][:, -1, :]
+            kf = data[0][:, -k:, :]
+            inputs, targets = data[0][:, :-k - 1, :], data[1][:, :-1, :]
+            inputs = torch.cat([inputs, kf], dim=1)
+
+            inputs, targets= inputs.to(device), targets.to(device)
+
+            real_label = torch.ones(size=(targets.shape[0], targets.shape[2]), device=device)
+            fake_label = torch.zeros(size=(targets.shape[0], targets.shape[2]), device=device)
+
+            torch.cuda.synchronize()
+            tstart = time.clock()
+            predict_outputs,_ = generator(inputs)
+            predict_prob,predict_middle=discriminator(predict_outputs)
+            real_prob,real_middle=discriminator(targets)
+
+            loss_d = criterion_d(predict_prob, fake_label)+criterion_d(real_prob,real_label)
+            loss_gb=criterion_g(predict_middle,real_middle)
+            loss_gm=criterion_g(predict_outputs,targets)
+            loss_g=lambda_b*loss_gb+lambda_m*loss_gm
+            torch.cuda.synchronize()
+            tend = time.clock()
+            per_time = (tend - tstart) / len(inputs)
+
+            err=criterion2(predict_outputs,targets)
+            loss_f = criterion_g(predict_middle, real_middle)
+            pred_loss_d +=  loss_d.item()
+            pred_loss_features +=  loss_f.item()
+            pred_loss_g+=loss_g.item()
+            real_seqs[start_idx:end_idx, :, :] = targets
+            predict_seqs[start_idx:end_idx, :, :] = predict_outputs
+            errlist[start_idx:end_idx, :, :] = err
+            labels[start_idx:end_idx, :] = label
+            predict_probs[start_idx:end_idx, :] = predict_prob
+
+        torch.cuda.synchronize()
+        t1 = time.clock()
+        cpu_time = t1 - t0
+        predict_seqs = predict_seqs.detach().cpu().numpy()
+        real_seqs = real_seqs.detach().cpu().numpy()
+        errlist = errlist.detach().cpu().numpy()
+        labels = labels.detach().cpu().numpy()
+        predict_probs = predict_probs.detach().cpu().numpy()
+        test_stats = {
+            'G_loss':pred_loss_g,
+            'D_loss':pred_loss_d,
+            "error_vectors":errlist,
+            "true_labels": labels,
+            'predict_seqs': predict_seqs,
+            'real_seqs': real_seqs,
+            'predict_probs':predict_probs
+        }
+        pickle.dump(test_stats, open(outp + filename + '_errslabels.pkl', 'wb'))
+        df = pd.DataFrame(columns=['prediction D loss', 'prediction feature loss','cpu_time', 'per inference time'])
+        df = df.append({'prediction D loss': pred_loss_d, 'prediction feature loss': pred_loss_features,'cpu_time': cpu_time, 'per inference time': per_time},
+                       ignore_index=True)
+        df.to_csv(outp + filename + '_losstime.csv')
+        torch.cuda.empty_cache()
+        del testloader
+        gc.collect()
+    return
+
+
+
+if __name__ == "__main__":
+
+    repeats = 5
+    epoches = 100
+    d_clip = 0.01
+    pw=3
+    k =   3
+    hw = 24
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batchsize = 64
+
+    input_dim = 1
+    k_freq = 3
+
+
+    output_dim = input_dim
+
+    lambda_b = 0.01
+    lambda_m = 1
+    patience = 20
+    threshold = 2
+    p0 = '/mnt/A/PycharmProject/condition_uts/yahoo/A2/beatGAN/'
+    if os.path.exists(p0) == False:
+        os.mkdir(p0, 0o777)
+    p0=p0+'k'+str(k)+'/'
+    if os.path.exists(p0) == False:
+        os.mkdir(p0, 0o777)
+    p0=p0+'hw'+str(hw)+'/'
+    if os.path.exists(p0) == False:
+        os.mkdir(p0, 0o777)
+
+    datapath=datapath+'hw'+str(hw)+'pw'+str(pw)+'/'
+    opt = Options(ngf=8, ndf=8,  c_in=4, c_out=1, lb=hw, lp=pw)
+
+    rootp = p0 + 'pw' + str(pw) + '/'
+    if os.path.exists(rootp) == False:
+        os.mkdir(rootp, 0o777)
+
+    ppath = rootp
+    if os.path.exists(ppath) == False:
+        os.mkdir(ppath, 0o777)
+
+    for r in range(repeats):
+        outp = ppath + str(r) + '/'
+        if os.path.exists(outp) == False:
+            os.mkdir(outp, 0o777)
+
+
+        generator = Generator(opt)
+        generator = nn.DataParallel(generator)
+        generator.to(device)
+        discriminator = Discriminator(opt)
+        discriminator = nn.DataParallel(discriminator)
+        discriminator.to(device)
+        optimizer_g = optim.RMSprop(generator.parameters(), lr=1e-4)
+        optimizer_d = optim.RMSprop(discriminator.parameters(), lr=1e-4)
+        vloss = float('inf')
+        ep = -1
+        counter = 0
+        total_running = epoches
+        epoch_train_times = []
+        for epoch in range(epoches):
+            trainloader, val1loader, val2loader, testloader = form_dataloader(batchsize, datapath, hw,pw)
+
+            torch.cuda.synchronize()
+            start = time.clock()
+            train(generator, k_freq, lambda_m, lambda_b, discriminator, d_clip, device,
+                trainloader,  epoch,  optimizer_g,optimizer_d)
+
+            torch.cuda.synchronize()
+            end = time.clock()
+            epoch_train_time = end - start
+            epoch_train_times.append(epoch_train_time)
+
+            vloss, ep, counter, val_labels = val(generator, k_freq,pw,opt.c_out, lambda_b, lambda_m,
+                                                                   discriminator, device, val1loader,  epoch,
+                                                                   ep, vloss, counter, patience,
+                                                                   threshold, outp, optimizer_g)
+
+            if counter == patience:
+                total_running = epoch + 1
+                break
+            torch.cuda.empty_cache()
+        time_data = np.asarray(epoch_train_times).T
+        df_train_time = pd.DataFrame(columns=['epoch_train_time'], data=time_data)
+        df_train_time.loc['mean', 'epoch_train_time'] = df_train_time['epoch_train_time'].mean()
+        df_train_time.to_csv(outp + 'epoch_train_time.csv')
+
+        trainloader, val1loader, val2loader, testloader = form_dataloader(batchsize, datapath, hw, pw)
+
+        inference(device,val2loader,  lambda_m, lambda_b,  k_freq,pw,opt, outp, 'val2')
+        inference(device, testloader, lambda_m, lambda_b,  k_freq,pw, opt, outp, 'test')
+
+
+
+
+
+
+
