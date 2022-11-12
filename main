@@ -35,14 +35,7 @@ import score_GAN
 import gc
 
 import math
-# import dataformatter
-# import scipy
 
-
-#from pytorchtools import EarlyStopping
-# from torch.tools import EarlyStopping
-# np.random.seed(7)
-# torch.manual_seed(1)  # reproducible
 
 
 datapath='/mnt/A/dataset/Yahoo A1A2/ydata-labeled-time-series-anomalies-v1_0/A2Benchmark/'
@@ -87,11 +80,11 @@ def form_dataloader(batchsize,inpath,lb,lp):
     test_x = torch.cat([test_x, test_kf], dim=1)
 
     torch_trainset = Data.TensorDataset(train_x, train_y)
-    # 把 dataset 放入 DataLoader
+  
     trainloader = Data.DataLoader(
-        dataset=torch_trainset,  # torch TensorDataset format
-        batch_size=batchsize,  # mini batch size
-        shuffle=True  # 要不要打乱数据 (打乱比较好)
+        dataset=torch_trainset, 
+        batch_size=batchsize, 
+        shuffle=True  
     )
     val1data = Data.TensorDataset(val1_x, val1_y)
     val1loader = Data.DataLoader(dataset=val1data, shuffle=True, batch_size=batchsize)
