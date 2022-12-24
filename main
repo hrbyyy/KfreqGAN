@@ -13,14 +13,12 @@ fatherpath = os.path.split(curPath)[0]
 grandpath=os.path.split(fatherpath)[0]
 greatgrandpath=os.path.split(grandpath)[0]
 gggpath=os.path.split(greatgrandpath)[0]
-extra_path='/home/ices/PycharmProject/shape_sequence_kpi/uts/conditional_conv/model_combine/'
 sys.path.append(fatherpath)
 sys.path.append(curPath)
 sys.path.append(grandpath)
 sys.path.append(greatgrandpath)
 sys.path.append(gggpath)
 sys.path.append(os.path.split(gggpath)[0])
-sys.path.append(extra_path)
 import numpy as np
 import pandas as pd
 import torch.optim as optim
